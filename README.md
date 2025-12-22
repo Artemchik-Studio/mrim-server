@@ -20,6 +20,7 @@
 3. Создайте базу данных и импортируйте туда содержимое `mrimdb.sql`
 4. Пропишите в консоли `npm i`, а после установки `npm audit fix`
 5. Настройте сервер, см. [настройка](/docs/config.md)
+6. Просмотрите документацию по настройке образов
 6. Запустите сервер командой `npm start`
 
 Если при запуске выходит ошибка `Could not load the "sharp" module using the linux runtime`, введите в консоли `npm install --include=optional sharp`
