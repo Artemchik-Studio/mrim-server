@@ -55,6 +55,10 @@ const {
   MrimUserStatusUpdate,
   MrimUserXStatusUpdate
 } = require('../../messages/mrim/status')
+const {
+  MrimChangeMicroblogStatus,
+  MrimMicroblogStatus
+} = require('../../messages/mrim/microblog')
 const { MrimGameData } = require('../../messages/mrim/games')
 const { MrimFileTransfer, MrimFileTransferAnswer } = require('../../messages/mrim/files')
 const { MrimCall, MrimCallAnswer } = require('../../messages/mrim/calls')
@@ -76,10 +80,13 @@ const {
   cleanupOfflineMessages,
   sendOfflineMessage,
   isContactAuthorized,
-  isContactAdder
+  isContactAdder,
+  getMicroblogSettings
 } = require('../../database')
+const { getZodiacId } = require('../../tools/zodiac')
 const config = require('../../../config')
 const { Iconv } = require('iconv')
+const https = require('https')
 
 const MrimSearchRequestFields = {
   USER: 0,
@@ -145,8 +152,6 @@ async function generateLegacyContactList (containerHeader, userId, state = null)
     })
   }
 
-  //
-
   // создаём группу
 
   const groupsBuffer = Buffer.alloc(0xa00, 0x00)
@@ -166,11 +171,15 @@ async function generateLegacyContactList (containerHeader, userId, state = null)
     const requesterIsAdder = contact.requester_is_adder === 1 && contact.is_auth_success === 1
     return requesterIsAdder || contact.requester_is_contact === 1
   }).map((contact, index) => {
-    const groupIndex = contactGroups.findIndex(
+    let groupIndex = contactGroups.findIndex(
       (group) => contact.requester_is_adder
         ? group.id === contact.adder_group_id
         : group.id === contact.contact_group_id
     )
+
+    if (groupIndex === -1) {
+      groupIndex = 0
+    }
 
     const nickname = contact.contact_nickname ?? contact.user_nickname ?? contact.user_login
     const nicknameLength = nickname.length.toString(16).padStart(2, '0')
@@ -368,6 +377,13 @@ async function generateContactList (containerHeader, userId, state = null) {
         }
 
         // добавляем новые поля в структуру контакта в зависимости от версии протокола
+
+        if (containerHeader.protocolVersionMinor >= 20) {
+          contactStructure.microblogId = connectedContact?.microblog?.text !== undefined ? 4 : 0
+          contactStructure.microblogUnixTime = connectedContact?.microblog?.date ?? 0
+          contactStructure.microblogLastMessage = connectedContact?.microblog?.text ?? ''
+          
+        }
 
         if (containerHeader.protocolVersionMinor >= 15) {
           contactStructure.xstatusType = connectedContact?.xstatus?.type ?? ''
@@ -1283,10 +1299,6 @@ async function processSearch (
   }
 
   for (const user of searchResults) {
-    user.birthday = user.birthday
-      ? `${user.birthday.getFullYear()}-${(user.birthday.getMonth() + 1).toString().padStart(2, '0')}-${user.birthday.getDate().toString().padStart(2, '0')}`
-      : ''
-
     for (const key of Object.values(responseFields)) {
       let value = new Iconv('UTF-8', state.utf16capable && key !== 'birthday' && key !== 'domain' && key !== 'login' ? 'UTF-16LE' : 'CP1251').convert(
         Object.hasOwn(user, key) && user[key] !== null ? `${user[key]}` : ''
@@ -1294,6 +1306,17 @@ async function processSearch (
 
       if (key === 'mrim_status') {
         value = new Iconv('UTF-8', 'CP1251').convert('3')
+      }
+
+      if (key === 'birthday') {
+        let birthday = user.birthday
+          ? `${user.birthday.getFullYear()}-${(user.birthday.getMonth() + 1).toString().padStart(2, '0')}-${user.birthday.getDate().toString().padStart(2, '0')}`
+          : ''
+        value = new Iconv('UTF-8', 'CP1251').convert(birthday)
+      }
+
+      if (key === 'zodiac') {
+        value = new Iconv('UTF-8', 'CP1251').convert(`${getZodiacId(user.birthday)}`)
       }
 
       anketaInfo = anketaInfo.integer(value.length, 4).subbuffer(value)
@@ -2150,6 +2173,127 @@ async function processCallAnswer (
   }
 }
 
+async function processNewMicroblog (
+  containerHeader,
+  packetData,
+  connectionId,
+  logger,
+  state,
+  variables
+) {
+  const microblog = MrimChangeMicroblogStatus.reader(packetData, state.utf16capable)
+
+  // TODO: logic to send it to external social networks
+
+  const microblogSettings = await getMicroblogSettings(state.userId)
+
+  // openvk
+
+  if (microblogSettings.type === 'openvk') {
+    try {
+      const opt = {
+        hostname: microblogSettings.instance,
+        port: 443,
+        path: '/method/wall.post?' +
+          'owner_id=' + microblogSettings.userId +
+          '&message=' + encodeURIComponent(microblog.text) +
+          '&access_token=' + microblogSettings.token,
+        method: 'GET'
+      }
+
+      https.get(opt, (res) => {
+        res.setEncoding('utf8')
+        let responseBody = ''
+
+        res.on('data', (chunk) => {
+          responseBody += chunk
+        })
+
+        res.on('end', () => {
+          logger.debug(`[${connectionId}] posted to OpenVK: ${responseBody}`)
+        })
+      })
+    } catch (e) {
+      logger.error(`[${connectionId}] failed to post to OpenVK: ${e.stack}`)
+    }
+  }
+
+  state.microblog = {
+    text: microblog.text,
+    date: Math.floor(Date.now() / 1000)
+  } 
+
+  state.xstatus.description = microblog.text // duplication for older clients
+
+  logger.debug(`[${connectionId}] new microblog post from ${state.username}@${state.domain} -> ${microblog.text}`)
+
+    const userMicroblogUpdate = MrimMicroblogStatus.writer({
+      flags: microblog.flags,
+      contact: `${state.username}@${state.domain}`,
+      text: microblog.text,
+      id: 42,
+      time: Math.floor(Date.now() / 1000)
+    }, true)
+
+  const contacts = await getContactsFromGroups(state.userId)
+
+  for (const contact of contacts) {
+    const client = global.clients.find(
+      ({ userId }) => userId === contact.user_id
+    )
+
+    if (client === undefined) {
+      continue
+    }
+
+    if (contact.is_auth_success === 0) {
+      continue
+    }
+
+    if (client.protocolVersionMinor < 20) {
+      continue
+    }
+
+    // если статус невидимый
+    const contactFlags = contact.requester_is_adder
+      ? contact.contact_flags
+      : contact.adder_flags
+
+    if (contactFlags & MrimContactFlags.NEVER_VISIBLE || contactFlags & MrimContactFlags.IGNORED) {
+      continue
+    }
+
+    client.socket.write(
+      new BinaryConstructor()
+        .subbuffer(
+          MrimContainerHeader.writer({
+            ...containerHeader,
+            packetCommand: MrimMessageCommands.USER_BLOG_STATUS,
+            dataSize: userMicroblogUpdate.length
+          })
+        )
+        .subbuffer(userMicroblogUpdate)
+        .finish()
+    )
+
+    logger.debug(`[${connectionId}] 'll send ${state.username}@${state.domain}'s new microblog post to ${contact.user_login}@${contact.user_domain}`)
+  }
+
+  return {
+    reply: 
+      new BinaryConstructor()
+        .subbuffer(
+          MrimContainerHeader.writer({
+            ...containerHeader,
+            packetCommand: MrimMessageCommands.USER_BLOG_STATUS,
+            dataSize: userMicroblogUpdate.length
+          })
+        )
+        .subbuffer(userMicroblogUpdate)
+        .finish()
+    }
+}
+
 module.exports = {
   processHello,
   processLegacyLogin,
@@ -2166,5 +2310,6 @@ module.exports = {
   processFileTransfer,
   processFileTransferAnswer,
   processCall,
-  processCallAnswer
+  processCallAnswer,
+  processNewMicroblog
 }
